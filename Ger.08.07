@@ -8,15 +8,12 @@ namespace cAlgo.Robots
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
     public class FVG_HighestHigh_OverlapBot : Robot
     {
-        #region Risk Management Parameters
         [Parameter("Risk per Trade (%)", Group = "Risk Management", DefaultValue = 1.0, MinValue = 0.1)]
         public double RiskPerTradePercent { get; set; }
 
         [Parameter("Reward Ratio (TP)", Group = "Risk Management", DefaultValue = 2.0)]
         public double RewardRatio { get; set; }
-        #endregion
 
-        #region Logic Parameters
         [Parameter("Lookback Period (Overlap)", Group = "Logic", DefaultValue = 20, MinValue = 1)]
         public int Lookback { get; set; }
 
@@ -25,26 +22,55 @@ namespace cAlgo.Robots
 
         [Parameter("Swing Lookback (SL)", Group = "Logic", DefaultValue = 5, MinValue = 1)]
         public int SwingLookback { get; set; }
-        #endregion
+
+        // === SAISON-PARAMETER ===
+        [Parameter("Saison Start Monat", Group = "Saisonfilter", DefaultValue = 8, MinValue = 1, MaxValue = 12)]
+        public int StartMonth { get; set; }
+
+        [Parameter("Saison Start Tag", Group = "Saisonfilter", DefaultValue = 23, MinValue = 1, MaxValue = 31)]
+        public int StartDay { get; set; }
+
+        [Parameter("Saison End Monat", Group = "Saisonfilter", DefaultValue = 9, MinValue = 1, MaxValue = 12)]
+        public int EndMonth { get; set; }
+
+        [Parameter("Saison End Tag", Group = "Saisonfilter", DefaultValue = 2, MinValue = 1, MaxValue = 31)]
+        public int EndDay { get; set; }
+
+        [Parameter("2. Saison aktivieren", Group = "Saisonfilter", DefaultValue = false)]
+        public bool UseSeason2 { get; set; }
+
+        [Parameter("2. Saison Start Monat", Group = "Saisonfilter", DefaultValue = 11, MinValue = 1, MaxValue = 12)]
+        public int StartMonth1 { get; set; }
+
+        [Parameter("2. Saison Start Tag", Group = "Saisonfilter", DefaultValue = 15, MinValue = 1, MaxValue = 31)]
+        public int StartDay1 { get; set; }
+
+        [Parameter("2. Saison End Monat", Group = "Saisonfilter", DefaultValue = 12, MinValue = 1, MaxValue = 12)]
+        public int EndMonth1 { get; set; }
+
+        [Parameter("2. Saison End Tag", Group = "Saisonfilter", DefaultValue = 24, MinValue = 1, MaxValue = 31)]
+        public int EndDay1 { get; set; }
 
         private int _lastFvgBar = -1;
 
         protected override void OnBar()
         {
             int i = Bars.Count - 1;
-            if (i < 50) return;
+            if (i < 30) return;
 
-            // 1. FVG Definition (3-Kerzen-Muster)
+            if (!IsInSeason())
+            {
+                return;
+            }
+
             double gapBottom = Bars.HighPrices[i - 3];
             double gapTop = Bars.LowPrices[i - 1];
 
-            // Bullisches FVG vorhanden?
             if (gapBottom < gapTop && _lastFvgBar != i)
             {
                 double swingHighPrice = -1;
                 bool swingFound = false;
 
-                // 2. Swing High Suche vor dem Gap
                 for (int j = i - 5; j >= i - 5 - Lookback && j >= 2; j--)
                 {
                     if (Bars.HighPrices[j] > Bars.HighPrices[j - 1] && 
@@ -59,7 +85,6 @@ namespace cAlgo.Robots
                 bool validSetup = false;
                 double entryPrice = 0;
 
-                // 3. Prüfen, ob das Swing High unterhalb des FVG (innerhalb der MaxDistancePips) liegt
                 if (swingFound)
                 {
                     double maxAllowedDistance = MaxDistancePips * Symbol.PipSize;
@@ -73,41 +98,35 @@ namespace cAlgo.Robots
                 }
 
                 if (!validSetup)
-                    return;
+                {
+                    return; 
+                }
 
-                // 4. Stop Loss & Take Profit ermitteln
-                double slPrice = GetLastSwingLowBody(i) - (2 * Symbol.PipSize);
+                // === STOP LOSS: Exakt am Tief der Swing-Low-Kerze ===
+                double slPrice = GetExactSwingLow(i);
                 if (slPrice >= entryPrice || slPrice <= 0) return;
 
                 double slPips = (entryPrice - slPrice) / Symbol.PipSize;
-                double tpPips = slPips * RewardRatio;
 
-                // 5. Positions-Management (Maximal 1 Trade/Order gleichzeitig)
                 if (Positions.Any(p => p.Label == "FVG_Overlap" && p.SymbolName == SymbolName))
                     return;
 
-                // Alte schwebende Orders bereinigen
                 foreach (var order in PendingOrders.Where(o => o.Label == "FVG_Overlap" && o.SymbolName == SymbolName))
-                {
                     CancelPendingOrder(order);
-                }
 
-                // 6. Risikoberechnung & Orderausführung
                 double riskAmount = Account.Equity * (RiskPerTradePercent / 100.0);
                 double riskPerVolumeUnit = slPips * Symbol.PipValue;
 
                 if (riskPerVolumeUnit > 0)
                 {
                     double rawVolume = riskAmount / riskPerVolumeUnit;
-                    // Standardisierte Lautstärkennormalisierung ohne RoundMode
                     double volume = Symbol.NormalizeVolumeInUnits(rawVolume);
 
                     if (volume >= Symbol.VolumeInUnitsMin)
                     {
-                        PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Overlap", slPips, tpPips);
+                        PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Overlap", slPips, slPips * RewardRatio);
                         _lastFvgBar = i;
                         
-                        // Chart-Visualisierung
                         Chart.DrawHorizontalLine("Entry_PD_" + i, entryPrice, Color.Gold, 2);
                         Chart.DrawHorizontalLine("SL_" + i, slPrice, Color.Red, 1, LineStyle.Lines);
                     }
@@ -115,34 +134,55 @@ namespace cAlgo.Robots
             }
         }
 
-        // Ermittelt das tiefste Kerzenkörper-Tief der letzten Swings für den SL
-        private double GetLastSwingLowBody(int fromIndex)
+        private bool IsInSeason()
         {
-            int minIndex = Math.Max(0, fromIndex - 30);
-            for (int j = fromIndex - 2; j >= minIndex; j--)
+            DateTime current = Server.Time;
+
+            if (IsDateInRange(current, StartMonth, StartDay, EndMonth, EndDay))
+                return true;
+
+            if (UseSeason2 && IsDateInRange(current, StartMonth1, StartDay1, EndMonth1, EndDay1))
+                return true;
+
+            return false;
+        }
+
+        private bool IsDateInRange(DateTime current, int startMonth, int startDay, int endMonth, int endDay)
+        {
+            DateTime startDate = new DateTime(current.Year, startMonth, startDay);
+            DateTime endDate = new DateTime(current.Year, endMonth, endDay);
+
+            if (startDate > endDate)
             {
-                double bodyLow = Math.Min(Bars.OpenPrices[j], Bars.ClosePrices[j]);
+                return current >= startDate || current <= endDate;
+            }
+
+            return current >= startDate && current <= endDate;
+        }
+
+        // === Exaktes Swing Low (Low-Preis) ermitteln ===
+        private double GetExactSwingLow(int fromIndex)
+        {
+            for (int j = fromIndex - 2; j >= fromIndex - 30; j--)
+            {
+                if (j - SwingLookback < 0) break;
+
+                double candidateLow = Bars.LowPrices[j];
                 bool isSwing = true;
 
                 for (int k = 1; k <= SwingLookback; k++)
                 {
-                    if (j - k < 0)
-                    {
-                        isSwing = false;
-                        break;
-                    }
-                    double neighborLow = Math.Min(Bars.OpenPrices[j - k], Bars.ClosePrices[j - k]);
-                    if (bodyLow > neighborLow)
+                    if (candidateLow > Bars.LowPrices[j - k] || candidateLow > Bars.LowPrices[j + k])
                     {
                         isSwing = false;
                         break;
                     }
                 }
 
-                if (isSwing) return bodyLow;
+                if (isSwing) return candidateLow; // Exakter Tiefstpreis der Kerze
             }
 
-            return Bars.LowPrices[fromIndex - 3];
+            return Bars.LowPrices[fromIndex - 3]; // Fallback auf das Tief von Kerze 1 des Muster-Entstehens
         }
     }
 }
