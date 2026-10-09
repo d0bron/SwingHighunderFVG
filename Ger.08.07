@@ -6,183 +6,183 @@ using cAlgo.API.Internals;
 namespace cAlgo.Robots
 {
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class FVG_HighestHigh_OverlapBot : Robot
+    public class Native_MTF_DailySL_Bot : Robot
     {
+        // === RISK MANAGEMENT PARAMETER ===
         [Parameter("Risk per Trade (%)", Group = "Risk Management", DefaultValue = 1.0, MinValue = 0.1)]
         public double RiskPerTradePercent { get; set; }
 
         [Parameter("Reward Ratio (TP)", Group = "Risk Management", DefaultValue = 2.0)]
         public double RewardRatio { get; set; }
 
-        [Parameter("Lookback Period (Overlap)", Group = "Logic", DefaultValue = 20, MinValue = 1)]
-        public int Lookback { get; set; }
+        // === DAILY PARAMS ===
+        [Parameter("Daily Lookback (Tage)", Group = "Daily Settings", DefaultValue = 20, MinValue = 1)]
+        public int DailyLookback { get; set; }
 
-        [Parameter("Max Abstand Swing zu FVG (Pips)", Group = "Logic", DefaultValue = 25.0, MinValue = 1.0)]
+        [Parameter("Max Abstand Swing zu FVG (Pips)", Group = "Daily Settings", DefaultValue = 50.0, MinValue = 1.0)]
         public double MaxDistancePips { get; set; }
 
-        [Parameter("Swing Lookback (SL)", Group = "Logic", DefaultValue = 5, MinValue = 1)]
-        public int SwingLookback { get; set; }
+        [Parameter("Daily Swing Low Lookback (SL)", Group = "Daily Settings", DefaultValue = 5, MinValue = 1)]
+        public int DailySwingLookback { get; set; }
 
-        // === SAISON-PARAMETER ===
-        [Parameter("Saison Start Monat", Group = "Saisonfilter", DefaultValue = 8, MinValue = 1, MaxValue = 12)]
-        public int StartMonth { get; set; }
+        private Bars _dailyBars;
 
-        [Parameter("Saison Start Tag", Group = "Saisonfilter", DefaultValue = 23, MinValue = 1, MaxValue = 31)]
-        public int StartDay { get; set; }
-
-        [Parameter("Saison End Monat", Group = "Saisonfilter", DefaultValue = 9, MinValue = 1, MaxValue = 12)]
-        public int EndMonth { get; set; }
-
-        [Parameter("Saison End Tag", Group = "Saisonfilter", DefaultValue = 2, MinValue = 1, MaxValue = 31)]
-        public int EndDay { get; set; }
-
-        [Parameter("2. Saison aktivieren", Group = "Saisonfilter", DefaultValue = false)]
-        public bool UseSeason2 { get; set; }
-
-        [Parameter("2. Saison Start Monat", Group = "Saisonfilter", DefaultValue = 11, MinValue = 1, MaxValue = 12)]
-        public int StartMonth1 { get; set; }
-
-        [Parameter("2. Saison Start Tag", Group = "Saisonfilter", DefaultValue = 15, MinValue = 1, MaxValue = 31)]
-        public int StartDay1 { get; set; }
-
-        [Parameter("2. Saison End Monat", Group = "Saisonfilter", DefaultValue = 12, MinValue = 1, MaxValue = 12)]
-        public int EndMonth1 { get; set; }
-
-        [Parameter("2. Saison End Tag", Group = "Saisonfilter", DefaultValue = 24, MinValue = 1, MaxValue = 31)]
-        public int EndDay1 { get; set; }
-
-        private int _lastFvgBar = -1;
+        protected override void OnStart()
+        {
+            // Zweites Timeframe (Daily) nativ laden – funktioniert perfekt im cTrader-Backtest
+            _dailyBars = MarketData.GetBars(TimeFrame.Daily);
+        }
 
         protected override void OnBar()
         {
-            int i = Bars.Count - 1;
-            if (i < 30) return;
-
-            if (!IsInSeason())
+            // Bot MUSS zwingend auf H4 gestartet werden
+            if (TimeFrame != TimeFrame.Hour4)
             {
+                Print("⚠️ Bitte starte den Bot ZWINGEND auf dem H4 Timeframe!");
                 return;
             }
 
-            double gapBottom = Bars.HighPrices[i - 3];
-            double gapTop = Bars.LowPrices[i - 1];
+            // Warten bis genügend Kerzen in beiden Timeframes vorhanden sind
+            if (Bars.Count < 30 || _dailyBars.Count < 30) return;
 
-            if (gapBottom < gapTop && _lastFvgBar != i)
+            // SCHRITT 1: Prüfen ob auf Daily ein valides Setup vorliegt
+            if (IsDailySetupActive(out double dailySwingHighPrice))
             {
-                double swingHighPrice = -1;
-                bool swingFound = false;
-
-                for (int j = i - 5; j >= i - 5 - Lookback && j >= 2; j--)
-                {
-                    if (Bars.HighPrices[j] > Bars.HighPrices[j - 1] && 
-                        Bars.HighPrices[j] > Bars.HighPrices[j + 1])
-                    {
-                        swingHighPrice = Bars.HighPrices[j];
-                        swingFound = true;
-                        break;
-                    }
-                }
-
-                bool validSetup = false;
-                double entryPrice = 0;
-
-                if (swingFound)
-                {
-                    double maxAllowedDistance = MaxDistancePips * Symbol.PipSize;
-
-                    if (swingHighPrice < gapBottom && swingHighPrice >= (gapBottom - maxAllowedDistance))
-                    {
-                        entryPrice = swingHighPrice;
-                        validSetup = true;
-                        Print("🎯 Swing High UNTER FVG gefunden: Entry bei {0} (FVG-Unterkante: {1})", entryPrice, gapBottom);
-                    }
-                }
-
-                if (!validSetup)
-                {
-                    return; 
-                }
-
-                // === STOP LOSS: Exakt am Tief der Swing-Low-Kerze ===
-                double slPrice = GetExactSwingLow(i);
-                if (slPrice >= entryPrice || slPrice <= 0) return;
-
-                double slPips = (entryPrice - slPrice) / Symbol.PipSize;
-
-                if (Positions.Any(p => p.Label == "FVG_Overlap" && p.SymbolName == SymbolName))
-                    return;
-
-                foreach (var order in PendingOrders.Where(o => o.Label == "FVG_Overlap" && o.SymbolName == SymbolName))
-                    CancelPendingOrder(order);
-
-                double riskAmount = Account.Equity * (RiskPerTradePercent / 100.0);
-                double riskPerVolumeUnit = slPips * Symbol.PipValue;
-
-                if (riskPerVolumeUnit > 0)
-                {
-                    double rawVolume = riskAmount / riskPerVolumeUnit;
-                    double volume = Symbol.NormalizeVolumeInUnits(rawVolume);
-
-                    if (volume >= Symbol.VolumeInUnitsMin)
-                    {
-                        PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Overlap", slPips, slPips * RewardRatio);
-                        _lastFvgBar = i;
-                        
-                        Chart.DrawHorizontalLine("Entry_PD_" + i, entryPrice, Color.Gold, 2);
-                        Chart.DrawHorizontalLine("SL_" + i, slPrice, Color.Red, 1, LineStyle.Lines);
-                    }
-                }
+                // SCHRITT 2: Einstieg auf H4 mit Daily Swing High & Daily Swing Low (SL) ausführen
+                ExecuteEntry(dailySwingHighPrice);
             }
         }
 
-        private bool IsInSeason()
+        /// <summary>
+        /// Prüft das übergeordnete Daily-Setup (Fair Value Gap + Swing High unter FVG Unterkante)
+        /// </summary>
+        private bool IsDailySetupActive(out double dailySwingHigh)
         {
-            DateTime current = Server.Time;
+            dailySwingHigh = -1;
 
-            if (IsDateInRange(current, StartMonth, StartDay, EndMonth, EndDay))
-                return true;
+            // Abgeschlossene Daily-Kerze
+            int d = _dailyBars.Count - 1;
 
-            if (UseSeason2 && IsDateInRange(current, StartMonth1, StartDay1, EndMonth1, EndDay1))
-                return true;
+            // Daily FVG Logik (Kerze d-3 High < Kerze d-1 Low)
+            double gapBottom = _dailyBars.HighPrices[d - 3];
+            double gapTop = _dailyBars.LowPrices[d - 1];
+
+            if (gapBottom < gapTop)
+            {
+                // Daily Swing High Suchen
+                for (int j = d - 5; j >= d - 5 - DailyLookback && j >= 2; j--)
+                {
+                    if (_dailyBars.HighPrices[j] > _dailyBars.HighPrices[j - 1] &&
+                        _dailyBars.HighPrices[j] > _dailyBars.HighPrices[j + 1])
+                    {
+                        double candidateSwing = _dailyBars.HighPrices[j];
+                        double maxAllowedDistance = MaxDistancePips * Symbol.PipSize;
+
+                        // Bedingung: Swing High liegt STRIKT unter FVG Bottom, aber innerhalb von MaxDistancePips
+                        if (candidateSwing < gapBottom && candidateSwing >= (gapBottom - maxAllowedDistance))
+                        {
+                            dailySwingHigh = candidateSwing;
+                            return true;
+                        }
+                    }
+                }
+            }
 
             return false;
         }
 
-        private bool IsDateInRange(DateTime current, int startMonth, int startDay, int endMonth, int endDay)
+        /// <summary>
+        /// Platziert die Limit-Order exakt auf Höhe des Daily Swing Highs mit SL unter dem Daily Swing Low
+        /// </summary>
+        private void ExecuteEntry(double targetEntryPrice)
         {
-            DateTime startDate = new DateTime(current.Year, startMonth, startDay);
-            DateTime endDate = new DateTime(current.Year, endMonth, endDay);
+            // Keine Mehrfachtrades zulassen
+            if (Positions.Any(p => p.Label == "MTF_Trade" && p.SymbolName == SymbolName) ||
+                PendingOrders.Any(o => o.Label == "MTF_Trade" && o.SymbolName == SymbolName))
+                return;
 
-            if (startDate > endDate)
+            int h = Bars.Count - 1;
+
+            // Einstieg exakt am Daily Swing High
+            double entryPrice = targetEntryPrice;
+            
+            // Stop-Loss: Ermittlung aus dem DAILY Chart (unter das Daily Swing Low)
+            double slPrice = GetDailySwingLow();
+            
+            // Validierung: SL muss logischerweise unter dem Entry liegen
+            if (slPrice >= entryPrice || slPrice <= 0) return;
+
+            // Berechnung des Abstands in Pips
+            double slPips = (entryPrice - slPrice) / Symbol.PipSize;
+
+            // Take Profit exakt auf 1:2 CRV (RewardRatio = 2.0)
+            double tpPips = slPips * RewardRatio;
+
+            // Dynamische Positionsgrößenberechnung basierend auf % Risiko
+            double riskAmount = Account.Equity * (RiskPerTradePercent / 100.0);
+            double riskPerVolumeUnit = slPips * Symbol.PipValue;
+
+            if (riskPerVolumeUnit > 0)
             {
-                return current >= startDate || current <= endDate;
-            }
+                double rawVolume = riskAmount / riskPerVolumeUnit;
+                double volume = Symbol.NormalizeVolumeInUnits(rawVolume);
 
-            return current >= startDate && current <= endDate;
+                if (volume >= Symbol.VolumeInUnitsMin)
+                {
+                    // Limit Order mit Daily-SL und 1:2 TP platziert
+                    PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "MTF_Trade", slPips, tpPips);
+                    
+                    Print("🚀 Limit Order platziert | Entry (Daily Swing High): {0} | SL (Daily Swing Low): {1} | TP (1:2): {2}", 
+                        entryPrice, slPrice, entryPrice + (tpPips * Symbol.PipSize));
+                    
+                    // Visuelle Linien im Chart einzeichnen
+                    Chart.DrawHorizontalLine("Entry_" + h, entryPrice, Color.Gold, 2);
+                    Chart.DrawHorizontalLine("SL_" + h, slPrice, Color.Red, 1, LineStyle.Lines);
+                    Chart.DrawHorizontalLine("TP_" + h, entryPrice + (tpPips * Symbol.PipSize), Color.Green, 1, LineStyle.Lines);
+                }
+            }
         }
 
-        // === Exaktes Swing Low (Low-Preis) ermitteln ===
-        private double GetExactSwingLow(int fromIndex)
+        /// <summary>
+        /// Ermittelt das tiefste Daily Swing Low aus dem Tageschart als strukturellen Stop Loss
+        /// </summary>
+        private double GetDailySwingLow()
         {
-            for (int j = fromIndex - 2; j >= fromIndex - 30; j--)
-            {
-                if (j - SwingLookback < 0) break;
+            int d = _dailyBars.Count - 1;
 
-                double candidateLow = Bars.LowPrices[j];
+            // Durchsuche die letzten Daily-Kerzen nach einem sauberen Swing Low
+            for (int j = d - 2; j >= d - 20; j--)
+            {
+                if (j - DailySwingLookback < 0) break;
+
+                double candidateLow = _dailyBars.LowPrices[j];
                 bool isSwing = true;
 
-                for (int k = 1; k <= SwingLookback; k++)
+                for (int k = 1; k <= DailySwingLookback; k++)
                 {
-                    if (candidateLow > Bars.LowPrices[j - k] || candidateLow > Bars.LowPrices[j + k])
+                    if (candidateLow > _dailyBars.LowPrices[j - k] || candidateLow > _dailyBars.LowPrices[j + k])
                     {
                         isSwing = false;
                         break;
                     }
                 }
 
-                if (isSwing) return candidateLow; // Exakter Tiefstpreis der Kerze
+                if (isSwing)
+                {
+                    // 5 Pips Sicherheits-Puffer unter das Daily Tief legen
+                    return candidateLow - (5 * Symbol.PipSize);
+                }
             }
 
-            return Bars.LowPrices[fromIndex - 3]; // Fallback auf das Tief von Kerze 1 des Muster-Entstehens
+            // Fallback: Tiefste Daily-Kerze der letzten 10 Tage nehmen
+            double minLow = double.MaxValue;
+            for (int i = d - 1; i >= d - 10; i--)
+            {
+                if (_dailyBars.LowPrices[i] < minLow)
+                    minLow = _dailyBars.LowPrices[i];
+            }
+
+            return minLow - (5 * Symbol.PipSize);
         }
     }
 }
